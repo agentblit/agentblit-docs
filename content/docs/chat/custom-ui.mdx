@@ -1,0 +1,230 @@
+---
+title: Custom Chat UI
+description: Build a custom chat client against AgentBlit chat v2 (AI SDK useChat)
+---
+
+Build your own chat UI against **AgentBlit chat v2**. The server speaks the standard [AI SDK](https://ai-sdk.dev) UI message stream. Prefer `useChat` + `DefaultChatTransport` — do not invent a custom protocol.
+
+## Reference implementation
+
+Clone and run the public examples first. Copy from them; do not re-derive the contract.
+
+**Repo:** [github.com/agentblit/agentblit-chat-examples](https://github.com/agentblit/agentblit-chat-examples)
+
+| Folder | Use when |
+| --- | --- |
+| [`simplest/`](https://github.com/agentblit/agentblit-chat-examples/tree/main/simplest) | Minimal text chat + stop + tool approvals |
+| [`full/`](https://github.com/agentblit/agentblit-chat-examples/tree/main/full) | Threads, files, markdown, tool activity, elicitation, MCP Apps |
+
+```bash
+git clone https://github.com/agentblit/agentblit-chat-examples.git
+cd agentblit-chat-examples/simplest
+cp .env.example .env.local
+# set NEXT_PUBLIC_AGENTBLIT_AGENT_ID
+# optional: NEXT_PUBLIC_AGENTBLIT_API_BASE=http://localhost:3000
+pnpm install && pnpm dev
+```
+
+Start with **`simplest/`**. Pull pieces from **`full/`** only when you need them.
+
+---
+
+## Contract
+
+### Endpoints
+
+Base: `{API_BASE}/api/v2/agents/{agentId}`
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/chat` | Send / resume a turn (UI message stream) |
+| `GET` | `/threads` | List threads |
+| `GET` | `/threads/{threadId}/messages` | Load UI messages for a thread |
+| `DELETE` | `/threads/{threadId}` | Delete a thread |
+| `POST` | `/files/upload` | Presign uploads → then `PUT` to each `uploadUrl` |
+| `POST` | `/threads/{threadId}/apps/bridge` | MCP App iframe host (`full/` only) |
+
+### Chat request
+
+```http
+POST {API_BASE}/api/v2/agents/{agentId}/chat
+Content-Type: application/json
+
+{
+  "id": "<thread-id>",
+  "messages": [ /* AI SDK UIMessage[] */ ]
+}
+```
+
+Response: AI SDK **UI message stream** (same shape `useChat` expects).
+
+### Rules (do not break these)
+
+1. **Server owns LLM history.** Client sends `id` + messages for the UI / interrupt decisions. Do not maintain a parallel OpenAI-style history for the model.
+2. **Reuse one `threadId`** for the conversation (`useChat({ id: threadId })`). Generate with `generateId()` or use a URL segment.
+3. **Approvals and elicitation resume the same assistant message.** After the user decides, let `useChat` POST again with updated tool parts — do not start a new user turn.
+4. **Enable auto-resume** with:
+
+```ts
+sendAutomaticallyWhen: ({ messages }) =>
+  lastAssistantMessageIsCompleteWithApprovalResponses({ messages }) ||
+  lastAssistantMessageIsCompleteWithToolCalls({ messages }),
+```
+
+5. Optional header `X-Agentblit-User: <end-user-id>` scopes threads per end user. CORS is open for custom UIs today.
+
+---
+
+## Step 1 — Minimal chat (required)
+
+Dependencies: `ai`, `@ai-sdk/react`.
+
+```ts
+const chatUrl = `${API_BASE}/api/v2/agents/${agentId}/chat`;
+```
+
+```tsx
+"use client";
+
+import { useChat } from "@ai-sdk/react";
+import {
+  DefaultChatTransport,
+  generateId,
+  lastAssistantMessageIsCompleteWithApprovalResponses,
+  lastAssistantMessageIsCompleteWithToolCalls,
+} from "ai";
+import { useMemo } from "react";
+
+export function Chat({ chatUrl }: { chatUrl: string }) {
+  const threadId = useMemo(() => generateId(), []);
+  const transport = useMemo(
+    () => new DefaultChatTransport({ api: chatUrl }),
+    [chatUrl],
+  );
+
+  const { messages, sendMessage, status, stop, addToolApprovalResponse, error } =
+    useChat({
+      id: threadId,
+      transport,
+      sendAutomaticallyWhen: ({ messages }) =>
+        lastAssistantMessageIsCompleteWithApprovalResponses({ messages }) ||
+        lastAssistantMessageIsCompleteWithToolCalls({ messages }),
+    });
+
+  // Render messages[].parts (text + tool parts).
+  // Send: await sendMessage({ text })
+  // Stop: stop()
+  // Approve: addToolApprovalResponse({ id: approvalId, approved: true|false })
+}
+```
+
+Exact UI wiring: [`simplest/src/components/chat.tsx`](https://github.com/agentblit/agentblit-chat-examples/blob/main/simplest/src/components/chat.tsx).
+
+### Tool approvals
+
+When a tool part has `state === "approval-requested"` and `approval.isAutomatic === false`, show Allow / Deny:
+
+```ts
+addToolApprovalResponse({ id: part.approval.id, approved: true });
+// or approved: false
+```
+
+`sendAutomaticallyWhen` continues the run after the response.
+
+---
+
+## Step 2 — Threads (optional)
+
+Use when the UI needs history across reloads.
+
+| Call | Client helper in examples |
+| --- | --- |
+| `GET .../threads` | `listThreads` |
+| `GET .../threads/{id}/messages` | `loadThreadMessages` → pass as `useChat({ messages: initial })` |
+| `DELETE .../threads/{id}` | `deleteThread` |
+
+Put `threadId` in the URL (see `full/` `/c/[threadId]`). Remount the chat panel with `key={threadId}` when switching threads.
+
+Source: [`full/src/lib/api.ts`](https://github.com/agentblit/agentblit-chat-examples/blob/main/full/src/lib/api.ts).
+
+---
+
+## Step 3 — File attachments (optional)
+
+1. `POST .../files/upload` with `{ files: [{ filename, mediaType, size }] }`.
+2. `PUT` each file to the returned `uploadUrl`.
+3. Send AI SDK file parts:
+
+```ts
+await sendMessage({
+  text,
+  files: [
+    {
+      type: "file",
+      mediaType,
+      filename,
+      url, // download URL from the upload ticket
+    },
+  ],
+});
+```
+
+Limits (server-enforced): up to **5** files, **10 MB** each. Images, PDF, and text-like types are supported.
+
+Source: [`full/src/lib/upload.ts`](https://github.com/agentblit/agentblit-chat-examples/blob/main/full/src/lib/upload.ts).
+
+Computer screenshots from tools arrive as normal assistant **`file`** parts when the tool sets `share_with_user`. Render `part.type === "file"` like any other attachment. Ignore markdown images that use a fake `attachment:` URL.
+
+---
+
+## Step 4 — Elicitation (optional)
+
+Some tools pause for structured user input. Detect elicitation on a tool part via `toolMetadata.elicitation` while `state === "input-available"`. Submit with:
+
+```ts
+addToolOutput({
+  tool: toolName,
+  toolCallId,
+  output: {
+    action: "accept" | "decline" | "cancel",
+    content?: Record<string, string>, // field values when accept
+  },
+});
+```
+
+Source: [`full/src/components/message.tsx`](https://github.com/agentblit/agentblit-chat-examples/blob/main/full/src/components/message.tsx) + `submitElicitation` in [`chat-panel.tsx`](https://github.com/agentblit/agentblit-chat-examples/blob/main/full/src/components/chat-panel.tsx).
+
+---
+
+## Step 5 — MCP Apps (optional)
+
+1. Listen for stream data parts of type `data-mcp-app`.
+2. Host the app iframe through:
+
+```http
+POST {API_BASE}/api/v2/agents/{agentId}/threads/{threadId}/apps/bridge
+```
+
+Bridge methods used by the iframe: `tools/call`, `resources/read`, `ui/update-model-context`.
+
+See the `full/` README for the intended host shape. Skip this until you need interactive MCP App UIs.
+
+---
+
+## Checklist for implementers / AI agents
+
+Copy this order:
+
+1. Clone [agentblit-chat-examples](https://github.com/agentblit/agentblit-chat-examples) and run `simplest/`.
+2. Wire `DefaultChatTransport` → `POST /api/v2/agents/{agentId}/chat`.
+3. Set `useChat` `id` + `sendAutomaticallyWhen` as above.
+4. Render `message.parts` (`text`, tool parts, later `file`).
+5. Implement approval Allow / Deny via `addToolApprovalResponse`.
+6. Only then add threads, uploads, elicitation, or MCP Apps from `full/`.
+
+**Do not:**
+
+- Call chat v1 (`/api/agents/.../chat`) for new UIs.
+- Send OpenAI `messages` / `tool_calls` payloads to v2.
+- Rebuild LLM memory on the client.
+- Skip `sendAutomaticallyWhen` if you support approvals or elicitation.

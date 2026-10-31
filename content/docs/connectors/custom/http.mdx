@@ -115,25 +115,42 @@ export interface CallToolsResponse {
 
 export interface ToolCallResult {
   tool_call_id: string;
+  /** Exactly one of `content` or `structuredContent` (not both) */
   result?: ToolResult;
   /** Soft failure for this row (HTTP 200) */
   error?: string;
   /** Pause and ask the user for input, then retry with elicitation_result */
   elicitation_required?: {
     message: string;
-    requestedSchema?: Record<string, unknown>;
+    requestedSchema?: ElicitationRequestedSchema;
   };
 }
 
-export interface ToolResult {
-  content?: ToolResultContent[];
-  /** Alternative to content[] — opaque JSON for the model */
-  structuredContent?: unknown;
-}
+/** Exclusive union — AgentBlit validates with Zod */
+export type ToolResult =
+  | { content: ToolResultContent[] }
+  | { structuredContent: unknown };
 
-export interface ToolResultContent {
-  type: 'text';
-  text: string;
+export type ToolResultContent =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType?: string };
+
+/** Flat JSON Schema object for elicitation forms */
+export interface ElicitationRequestedSchema {
+  type: 'object';
+  properties: Record<
+    string,
+    {
+      type: 'string' | 'number' | 'integer' | 'boolean';
+      title?: string;
+      description?: string;
+      enum?: string[];
+      minimum?: number;
+      maximum?: number;
+      default?: string | number | boolean | string[];
+    }
+  >;
+  required?: string[];
 }
 
 /** GET /api/1.0/resources/read?uri=… */
@@ -144,13 +161,24 @@ export interface ResourcesReadResponse {
 export interface UiResourceContent {
   uri: string;
   mimeType: 'text/html;profile=mcp-app';
-  text: string;
+  /** Prefer `text`; `blob` is base64 HTML fallback */
+  text?: string;
+  blob?: string;
   _meta?: {
     ui?: {
       prefersBorder?: boolean;
+      domain?: string;
       csp?: {
         connectDomains?: string[];
         resourceDomains?: string[];
+        frameDomains?: string[];
+        baseUriDomains?: string[];
+      };
+      permissions?: {
+        camera?: Record<string, never>;
+        microphone?: Record<string, never>;
+        geolocation?: Record<string, never>;
+        clipboardWrite?: Record<string, never>;
       };
     };
   };
@@ -245,25 +273,28 @@ type CallToolsResponse struct {
 }
 
 type ToolCallResult struct {
-	ToolCallID           string                `json:"tool_call_id"`
-	Result               *ToolResult           `json:"result,omitempty"`
-	Error                string                `json:"error,omitempty"`
-	ElicitationRequired  *ElicitationRequired  `json:"elicitation_required,omitempty"`
+	ToolCallID          string               `json:"tool_call_id"`
+	Result              *ToolResult          `json:"result,omitempty"` // content XOR structuredContent
+	Error               string               `json:"error,omitempty"`
+	ElicitationRequired *ElicitationRequired `json:"elicitation_required,omitempty"`
 }
 
+// ToolResult must include either Content or StructuredContent, not both.
 type ToolResult struct {
 	Content           []ToolResultContent `json:"content,omitempty"`
 	StructuredContent any                 `json:"structuredContent,omitempty"`
 }
 
 type ToolResultContent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type     string `json:"type"`               // "text" | "image"
+	Text     string `json:"text,omitempty"`     // when type=text
+	Data     string `json:"data,omitempty"`     // when type=image (base64)
+	MimeType string `json:"mimeType,omitempty"` // when type=image
 }
 
 type ElicitationRequired struct {
 	Message         string          `json:"message"`
-	RequestedSchema json.RawMessage `json:"requestedSchema,omitempty"`
+	RequestedSchema json.RawMessage `json:"requestedSchema,omitempty"` // flat object JSON Schema
 }
 
 // ResourcesReadResponse is the body for GET /api/1.0/resources/read.
@@ -273,8 +304,9 @@ type ResourcesReadResponse struct {
 
 type UiResourceContent struct {
 	URI      string          `json:"uri"`
-	MimeType string          `json:"mimeType"`
-	Text     string          `json:"text"`
+	MimeType string          `json:"mimeType"` // must be text/html;profile=mcp-app
+	Text     string          `json:"text,omitempty"`
+	Blob     string          `json:"blob,omitempty"` // base64 HTML fallback
 	Meta     json.RawMessage `json:"_meta,omitempty"`
 }
 ```
@@ -474,14 +506,18 @@ curl --location 'https://your-service.example.com/api/1.0/tools/call' \
 }
 ```
 
-Each item in `results` may include one of:
+Each item in `results` may include **one** of:
 
 | Field | Description |
 | --- | --- |
-| `result.content` | Array of `{ type: "text", text }` blocks; put JSON payloads in `text` as a string |
-| `result.structuredContent` | Alternative opaque JSON result |
+| `result.content` | Array of content blocks: `{ type: "text", text }` and/or `{ type: "image", data, mimeType? }` (`data` is base64). Put JSON payloads in `text` as a string. |
+| `result.structuredContent` | Opaque JSON result (exclusive alternative to `content`) |
 | `error` | Soft failure for this row (still HTTP 200) |
 | `elicitation_required` | Ask the user for input; AgentBlit retries with `elicitation_result` |
+
+`result` is an **exclusive union**: send either `content` or `structuredContent`, not both. Extra fields on `result` (for example a connector-local `_meta`) are stripped by AgentBlit validation.
+
+`elicitation_required.requestedSchema`, when present, must be a flat JSON Schema object (`type: "object"` with per-property `type` of `string` \| `number` \| `integer` \| `boolean`). Elicitation is optional — the [appointment-connector](https://github.com/agentblit/appointment-connector) reference implements list/call/resources but not elicitation. Tool calls from an MCP App iframe **cannot** use elicitation.
 
 Return HTTP `400` for invalid bodies and `401` when the API key is missing or invalid. Prefer `error` on a result row for tool-level failures so other calls in the batch can still succeed.
 
@@ -525,7 +561,8 @@ Requirements:
 
 - `uri` must start with `ui://`
 - `mimeType` must be exactly `text/html;profile=mcp-app`
-- `text` is the full HTML document rendered in an iframe
+- Provide HTML via `text` (preferred) or base64 `blob`
+- Optional `_meta.ui`: `prefersBorder`, `domain`, `csp` (`connectDomains`, `resourceDomains`, `frameDomains`, `baseUriDomains`), `permissions` (`camera`, `microphone`, `geolocation`, `clipboardWrite`)
 
 The HTML should use the MCP Apps bridge (`postMessage` JSON-RPC) so the iframe can call tools through AgentBlit (`tools/call`) instead of calling your connector directly. Keep `connectDomains` empty unless the app must fetch external origins.
 
